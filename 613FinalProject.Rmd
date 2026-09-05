@@ -1,0 +1,344 @@
+---
+title: "613FinalProject"
+author: "Avery Hamel"
+date: "2026-04-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+install.packages(c("caret", "vip"))
+library(caret)
+library(pROC)
+library(vip)
+library(tidyverse)
+library(nflverse)
+library(nflreadr)
+library(rsample)
+library(recipes)
+library(xgboost)
+library(parsnip)
+library(workflows)
+library(stringr)
+library(gt)
+library(gtExtras)
+```
+
+```{r}
+pbp_raw <- load_pbp(2016:2025)
+participation <- load_participation(seasons = 2016:2025) %>%
+  select(nflverse_game_id, play_id, possession_team, offense_formation,
+         offense_personnel, defense_personnel, defenders_in_box)
+
+model_data <- pbp_raw %>%
+  filter(pass_attempt == 1 | rush_attempt == 1, sack == 0, qb_scramble == 0, !is.na(yards_gained)) %>%
+  left_join(participation, by = c("game_id" = "nflverse_game_id", "play_id", "posteam" = "possession_team")) %>%
+  mutate(
+    # Research question 1: Binary target for 20+ yard gains 
+    is_big_play = as.factor(if_else(yards_gained >= 15, 1, 0)),
+    
+    # parsing for all personnel
+    ol = as.numeric(str_extract(offense_personnel, "(?<=\\s|^)\\d+(?=\\sOL)")),
+    rb = as.numeric(str_extract(offense_personnel, "(?<=\\s|^)\\d+(?=\\sRB)")),
+    te = as.numeric(str_extract(offense_personnel, "(?<=\\s|^)\\d+(?=\\sTE)")),
+    wr = as.numeric(str_extract(offense_personnel, "(?<=\\s|^)\\d+(?=\\sWR)")),
+    dl = as.numeric(str_extract(defense_personnel, "(?<=\\s|^)\\d+(?=\\sDL)")),
+    lb = as.numeric(str_extract(defense_personnel, "(?<=\\s|^)\\d+(?=\\sLB)")),
+    db = as.numeric(str_extract(defense_personnel, "(?<=\\s|^)\\d+(?=\\sDB)")),
+    
+    # Secondary research question: Personnel & field zone combos 
+    personnel_group = paste0(replace_na(rb, 0), replace_na(te, 0)),
+    field_zone = case_when(
+      yardline_100 <= 20 ~ "RedZone",
+      yardline_100 > 20 & yardline_100 <= 40 ~ "ScoringRange",
+      yardline_100 > 40 & yardline_100 <= 60 ~ "Midfield",
+      TRUE ~ "BackedUp"
+    )
+  ) %>%
+  replace_na(list(ol = 5, rb = 0, te = 0, wr = 0, dl = 0, lb = 0, db = 0)) %>%
+  mutate(extra_ol = if_else(ol > 5, 1, 0)) %>%
+  select(is_big_play, yardline_100, down, ydstogo, defenders_in_box, offense_formation, 
+         rb, te, wr, extra_ol, dl, lb, db, personnel_group, field_zone) %>%
+  na.omit() %>%
+  mutate(across(c(down, offense_formation, personnel_group, field_zone, extra_ol), as.factor))
+```
+
+```{r}
+# classification model
+set.seed(1234)
+data_split <- initial_split(model_data, prop = 0.8, strata = is_big_play)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+big_play_recipe <- recipe(is_big_play ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+# XGBoost classification specification (is_big_play)
+xgboost_spec <- boost_tree(trees = 500, tree_depth = 4, learn_rate = 0.05) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+big_play_workflow <- workflow() %>%
+  add_recipe(big_play_recipe) %>%
+  add_model(xgboost_spec)
+
+big_play_fit <- big_play_workflow %>%
+  fit(data = train_data)
+
+# add labels for personnel groups
+personnel_lookup <- data.frame(
+  personnel_group = c("11", "12", "21", "13", "01", "10", "22", "02"),
+  description = c("Standard (3WR)", "Heavy (2TE)", "Pro Set (2RB)", "Jumbo (3TE)", 
+                  "Empty (4WR)", "Spread (4WR/0TE)", "Pony (2RB/2TE)", "Empty (3WR/2TE)")
+)
+```
+
+```{r}
+# process results and join with group descriptions
+results <- predict(big_play_fit, test_data, type = "prob") %>%
+  bind_cols(predict(big_play_fit, test_data)) %>%
+  bind_cols(test_data) %>%
+  left_join(personnel_lookup, by = "personnel_group") %>%
+  mutate(description = replace_na(description, "Other/Specialty"),
+         is_big_play_num = as.numeric(as.character(is_big_play)))
+```
+
+```{r}
+# visualizations
+
+  # importance of variables
+big_play_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 10, geom = "col", aesthetics = list(fill = "#013369")) + 
+  scale_x_discrete(labels = c(
+    "yardline_100" = "Field Position",
+    "ydstogo"      = "Yards to Gain",
+    "down_X3"      = "Third Down",
+    "down_X4"      = "Fourth Down",
+    "defenders_in_box" = "Defenders in Box",
+    "db"           = "Defensive Backs",
+    "dl"           = "Defensive Linemen",
+    "lb"           = "Linebackers",
+    "wr"           = "Wide Receivers",
+    "te"           = "Tight Ends",
+    "offense_formation_PISTOL" = "Pistol Formation"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Primary Question: Pre-Snap Predictors of Explosive Plays",
+    subtitle = "Manual Variable Importance Labels for Professional Presentation",
+    x = "Situational Factor",
+    y = "Importance (Gain)"
+  )
+```
+```{r}
+  # ROC curve (model performance)
+auc_value <- results %>%
+  roc_auc(truth = is_big_play, .pred_1) %>%
+  pull(.estimate)
+
+
+# build plot w/ reference line
+results %>%
+  roc_curve(truth = is_big_play, .pred_1, event_level = "second") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_abline(lty = 3, color = "gray60", linewidth = 0.8) +
+  geom_path(color = "#013369", linewidth = 1.2) +
+  coord_equal() +
+  theme_minimal() +
+  labs(
+    title = "Model Performance: Predictive Efficiency",
+    subtitle = paste0("Receiver Operating Characteristic (AUC: 0.629)"),
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+# confusion matrix
+# create a binary prediction based on the "Danger" threshold
+cm_data <- results %>%
+  mutate(pred_at_10 = as.factor(if_else(.pred_1 >= 0.10, "1", "0")))
+cm <- cm_data %>%
+  conf_mat(truth = is_big_play, estimate = pred_at_10)
+
+# visualize matrix
+autoplot(cm, type = "heatmap") +
+  scale_fill_gradient(low = "white", high = "#013369") +
+  theme_minimal() +
+  labs(
+    title = "Confusion Matrix: 10% Probability Threshold",
+    subtitle = "Evaluating 'High Danger' Flags vs. Actual Explosive Plays",
+    x = "Actual Result (1 = 15+ Yards)",
+    y = "Model Prediction"
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r}
+# create gap model
+results_summary <- results %>%
+  mutate(is_big_play_num = as.numeric(as.character(is_big_play))) %>%
+  group_by(personnel_group, description) %>% 
+  summarize(
+    actual_rate = mean(is_big_play_num),
+    expected_rate = mean(.pred_1),
+    plays = n(),
+    .groups = 'drop'
+  ) %>%
+  filter(plays > 100) 
+
+ggplot(results_summary, aes(y = reorder(description, actual_rate))) +
+  geom_segment(aes(x = expected_rate, xend = actual_rate, 
+                   yend = reorder(description, actual_rate)), 
+               color = "#e3e3e3", linewidth = 1.5) +
+  geom_point(aes(x = expected_rate), color = "#013369", size = 4) +
+  geom_point(aes(x = actual_rate), color = "#D50A0A", size = 4) +
+  theme_bw() +
+  scale_x_continuous(labels = scales::percent) +
+  labs(
+    title = "Secondary Research: Personnel Grouping 'Boost'",
+    subtitle = "Gap between Situational Expectation (Blue) and Actual Explosiveness (Red)",
+    x = "Probability of 15+ Yard Gain",
+    y = "Offensive Personnel Grouping"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+results %>%
+  group_by(description) %>%
+  summarize(
+    total_plays = n(),
+    avg_prob = mean(.pred_1),
+    actual_rate = mean(is_big_play_num),
+    uplift = actual_rate - avg_prob 
+  ) %>%
+  filter(total_plays > 100) %>%
+  arrange(desc(actual_rate)) %>%
+  gt() %>%
+  cols_label(
+    description = "Personnel Grouping",
+    total_plays = "Sample Size",
+    avg_prob = "Expected Rate",
+    actual_rate = "Actual Rate",
+    uplift = "Uplift"
+  ) %>%
+  tab_header(
+    title = md("**NFL Personnel Groupings: Theory vs. Reality**"),
+    subtitle = "2016-2025 | Color-Coded Expected vs. Actual Explosiveness"
+  ) %>%
+  fmt_percent(columns = c(avg_prob, actual_rate, uplift), decimals = 2) %>%
+  data_color(
+    columns = avg_prob,
+    palette = "Greens",
+    domain = c(0.07, 0.13)
+  ) %>%
+  data_color(
+    columns = actual_rate,
+    palette = "Blues",
+    domain = c(0.03, 0.14)
+  ) %>%
+  data_color(
+    columns = uplift,
+    palette = c("#ff7f7f", "white", "#7fff7f")
+  ) %>%
+  gt_theme_538() %>%
+  gtsave("PersonnelGroupingsActualvsExpected.html")
+```
+
+```{r}
+# precision recall curve
+pr_auc_value <- results %>%
+  pr_auc(truth = is_big_play, .pred_1) %>%
+  pull(.estimate)
+
+results %>%
+  pr_curve(truth = is_big_play, .pred_1) %>%
+  ggplot(aes(x = recall, y = precision)) +
+# reference line
+  geom_hline(yintercept = mean(as.numeric(as.character(results$is_big_play))), 
+             lty = 3, color = "gray60") +
+# model PR line
+  geom_path(color = "#D50A0A", linewidth = 1.2) +
+  theme_minimal() +
+  coord_equal() +
+  labs(
+    title = "Model Evaluation: Precision-Recall Curve",
+    subtitle = paste0("Focus on Rare Event Detection (PR-AUC: ", round(pr_auc_value, 3), ")"),
+    x = "Recall (Ability to find all Big Plays)",
+    y = "Precision (Reliability of Big Play flags)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+# calibration curve
+results %>%
+  mutate(prob_bin = cut(.pred_1, breaks = seq(0, 1, by = 0.05), include.lowest = TRUE)) %>%
+  group_by(prob_bin) %>%
+  summarize(
+    actual_rate = mean(as.numeric(as.character(is_big_play))),
+    midpoint = mean(as.numeric(sub("\\]", "", sub("\\(", "", sub(".*,", "", prob_bin))))),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n > 10) %>%
+  ggplot(aes(x = midpoint, y = actual_rate)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  geom_line(color = "#D50A0A", linewidth = 1) +
+  geom_point(color = "#013369", size = 3) +
+  theme_bw() +
+  scale_x_continuous(labels = scales::percent, limits = c(0, .5)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, .5)) +
+  labs(
+    title = "Model Predictability: Calibration Curve",
+    subtitle = "Actual vs. Predicted Explosive Play Probability",
+    x = "Model Predicted Probability",
+    y = "Actual Observed Rate"
+  )
+```
+
+```{r}
+# predictability tiers table
+results %>%
+  mutate(tier = case_when(
+    .pred_1 > 0.15 ~ "High Danger (15%+)",
+    .pred_1 > 0.08 ~ "Moderate (8-15%)",
+    TRUE ~ "Low Threat (<8%)"
+  )) %>%
+  group_by(tier) %>%
+  summarize(
+    plays = n(),
+    actual_big_play_rate = mean(as.numeric(as.character(is_big_play)))
+  ) %>%
+  arrange(desc(actual_big_play_rate)) %>%
+  gt() %>%
+  gt_theme_538() %>%
+  tab_header(
+    title = "Pre-Snap Predictability Tiers",
+    subtitle = "Success rate of predicting 15+ yard gains"
+  ) %>%
+  fmt_percent(columns = actual_big_play_rate, decimals = 1) %>%
+  cols_label(
+    tier = "Probability Tier",
+    plays = "Sample Size",
+    actual_big_play_rate = "Actual Big Play Rate"
+  ) %>%
+  gtsave("PredictabilityTiers.html")
+```
+
